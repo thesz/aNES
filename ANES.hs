@@ -138,8 +138,8 @@ dnAtX x (N mu a) = numDerivative evalAtX v0
 	where
 		k = vLength x
 		v0 = vFromList $ vToList mu ++ aToList a
-		evalAtX v =	--m / sqrtDetS * exponent	-- makes for grad (    p(N,x))
-				toExp - log (abs deta1) / 2	-- makes for grad (log(p(N,x))
+		evalAtX v =	m / sqrtDetS * exponent	-- makes for grad (    p(N,x))
+				--toExp - log (abs deta1) / 2	-- makes for grad (log(p(N,x))
 			where
 				m = (2 * pi) ** (negate $ fromIntegral k / 2)
 				DN mu1 a1 = dnFromSplitted v
@@ -269,7 +269,9 @@ aNES lambda nu startMu eval stop = do
 				List.sort) $ mapM (const $ drawAssess n) [1..lambda]
 			let	matr = map snd scoredGrads
 				grad = foldr1 (+) $ map (uncurry vScale) scoredGrads
-				ngrad = mulByFisherInverse (Fisher (fromIntegral lambda) matr) grad
+				ngrad =
+					mulByFisherInverse (Fisher (fromIntegral lambda) matr) grad
+					--grad
 				n' = updateN nu ngrad n
 			--liftIO $ putStrLn $ "matr "++show matr
 			--liftIO $ putStrLn $ "grd "++show grad
