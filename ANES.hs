@@ -1,6 +1,24 @@
+-- |ANES.hs
+--
+-- Approximate Natural Evolution Strategies.
+--
+-- Natural Evolution Strategy at Wikipedia: https://en.wikipedia.org/wiki/Natural_evolution_strategy
+--
+-- The code here follows spirit of NES in the algorithm and uses
+-- approximation of square root of covariance matrix with
+-- sum of diagonal and outer product matrices.
+--
+-- Tests indicate it kinda sorta works.
+--
+-- I am not sure about Fisher Information Matrix multiplication, I'll sort that
+-- later. And I should have gradient of distribution in closed form, current
+-- implementation is way too slow.
+--
+-- Copyright (C) 2020 Serguey Zefirov.
+
 {-# OPTIONS -Wno-tabs #-}
 
-{-# LANGUAGE DerivingStrategies, FlexibleContexts, GeneralizedNewtypeDeriving
+{-# LANGUAGE FlexibleContexts, GeneralizedNewtypeDeriving
            , MultiParamTypeClasses, RecordWildCards
            , StandaloneDeriving #-}
 
@@ -13,6 +31,8 @@ import qualified Data.List as List
 
 import System.Random
 
+import qualified Numeric.LinearAlgebra as LA
+
 import Debug.Trace
 
 checkAsserts :: Bool
@@ -20,46 +40,35 @@ checkAsserts = True
 
 type FLOAT = Double
 
-newtype Vec = Vec { vec :: [FLOAT] } deriving (Eq, Ord, Show)
-
-instance Num Vec where
-	fromInteger x = error $ "vec does not support fromInteger, use @constVec "++show x++" someOtherVec@ instead"
-	Vec a + Vec b = Vec $ zipWith (+) a b
-	_ * _ = error "multiplication is not supported for vecs"
-	Vec a - Vec b = Vec $ zipWith (-) a b
-	abs (Vec xs) = Vec $ map abs xs
-	signum _ = error "no signum for vec"
+type Vec = LA.Vector FLOAT
 
 vSum :: Vec -> FLOAT
-vSum (Vec a) = sum a
+vSum = LA.sumElements
 
 vProduct :: Vec -> FLOAT
-vProduct (Vec a) = product a
+vProduct = LA.prodElements
 
 vMap :: (FLOAT -> FLOAT) -> Vec -> Vec
-vMap f (Vec a) = Vec $ map f a
-
-vZip :: (FLOAT -> FLOAT -> FLOAT) -> Vec -> Vec -> Vec
-vZip op (Vec a) (Vec b) = Vec $ zipWith op a b
+vMap f a = LA.cmap f a
 
 vInner :: Vec -> Vec -> FLOAT
-vInner (Vec a) (Vec b) = sum $ zipWith (*) a b
+vInner a b = LA.sumElements $ a * b
 
 vScale :: FLOAT -> Vec -> Vec
-vScale a (Vec b) = Vec $ map (* a) b
+vScale a b = LA.cmap (* a) b
 
 vL2, vL1 :: Vec -> FLOAT
 vL2 a = vInner a a
-vL1 (Vec a) = sum $ map abs a
+vL1 a = vSum $ LA.cmap abs a
 
 vFromList :: [FLOAT] -> Vec
-vFromList = Vec
+vFromList = LA.fromList
 
 vToList :: Vec -> [FLOAT]
-vToList (Vec a) = a
+vToList a = LA.toList a
 
 vLength :: Vec -> Int
-vLength (Vec a) = length a
+vLength a = LA.size a
 
 -- |A=diag(D) + UV^T.
 --
@@ -71,24 +80,24 @@ invertA :: A -> A
 invertA (A d u v) = A d' u' v'
 	where
 		d' = vMap (1/) d
-		g = vSum $ vZip (*) d' $ vZip (*) u v
+		g = vSum $ d' * u * v
 		alpha = (-1) / (1 + g)
-		v' = vScale alpha $ vZip (*) d' v
-		u' = vZip (*) d' u
+		v' = vScale alpha $ d' * v
+		u' = d' * u
 
 determinantA :: A -> FLOAT
 determinantA (A d u v) = (1 + tr) * vProduct d
 	where
 		d' = vMap (1/) d
-		tr = vSum $ vZip (*) d' $ vZip (*) u v
+		tr = vSum $ d' * u * v
 
 transposeA :: A -> A
 transposeA (A d u v) = A d v u
 
 matrMultA :: A -> Vec -> Vec
-matrMultA (A d u v) w = vZip (+) dw $ vScale vw u
+matrMultA (A d u v) w = dw + vScale vw u
 	where
-		dw = vZip (*) d w
+		dw = d * w
 		vw = vInner v w
 
 -- |Normal distribution parametrization.
@@ -117,7 +126,7 @@ numDerivative f center = vScale (0.5/d) $ dps + dms
 -- |Getting local gradient of a multivariate normal distribution
 -- at point x.
 --
--- Useful identies:
+-- Useful identities:
 -- d/dS(det(S)) = (1/det(S)) (S^-1)^T
 -- d/dA(S(A)^-1) = -(S(A)^-1)(d/dA(S(A)))(S(A)^-1)
 -- d/dq(A(q)^TA(q)) = (dA/dq)A + A^TdA/dq
@@ -129,7 +138,8 @@ dnAtX x (N mu a) = numDerivative evalAtX v0
 	where
 		k = vLength x
 		v0 = vFromList $ vToList mu ++ aToList a
-		evalAtX v = m / sqrtDetS * exponent
+		evalAtX v =	--m / sqrtDetS * exponent	-- makes for grad (    p(N,x))
+				toExp - log (abs deta1) / 2	-- makes for grad (log(p(N,x))
 			where
 				m = (2 * pi) ** (negate $ fromIntegral k / 2)
 				DN mu1 a1 = dnFromSplitted v
@@ -236,25 +246,25 @@ class Draw m where
 -- Lambda is a population size. StartMu is an initial
 -- averages. S is a state to evaluate against.
 -- And eval is a State action to evaluate a sample. 
-aNES :: (MonadIO m, Draw m) => Int -> FLOAT -> Vec -> (Vec -> m FLOAT) -> m Bool -> m Vec
+aNES :: (MonadIO m, Draw m) => Int -> FLOAT -> Vec -> (Vec -> m FLOAT) -> m (Maybe a) -> m a
 aNES lambda nu startMu eval stop = do
 	n <- startN startMu
-	loop n
+	loop 0 n
 	where
 		ilambda = 1.0 / fromIntegral lambda
-		loop n = do
-			--liftIO $ putStrLn $ "current n "++show n
+		loop i n = do
+			liftIO $ putStrLn $ "iteration "++show i++", current n "++show n
 			done <- stop
-			if done
-				then return (nMu n)
-				else contLoop n
+			case done of
+				Just r -> return r
+				_ -> contLoop i n
 		drawAssess n = do
 			sample <- drawSample n
 			score <- eval sample
 			let	grad = dnAtX sample n
 			--liftIO $ putStrLn $ "sample "++show sample++", score "++show score++", grad "++show grad
 			return (score, grad)
-		contLoop n = do
+		contLoop i n = do
 			scoredGrads <- fmap (zip (map ((^20) . (*ilambda)) [1..]) . map snd .
 				List.sort) $ mapM (const $ drawAssess n) [1..lambda]
 			let	matr = map snd scoredGrads
@@ -264,7 +274,7 @@ aNES lambda nu startMu eval stop = do
 			--liftIO $ putStrLn $ "matr "++show matr
 			--liftIO $ putStrLn $ "grd "++show grad
 			--liftIO $ putStrLn $ "ngrad "++show ngrad
-			loop n'
+			loop (i+1) n'
 
 genNormals :: StdGen -> [FLOAT]
 genNormals sg = transform rs
@@ -280,7 +290,9 @@ genNormals sg = transform rs
 
 _test_cg1 = conjugateGradient mm (vFromList [1,-1.0])
 	where
-		mm (Vec [a,b]) = vFromList [2*a+b, 3*b+a]
+		mm ab = vFromList [b, a]
+			where
+				[a,b] = vToList ab
 
 test_invertA1 = map (matrMultA a' . matrMultA a . vFromList) [[1,0,0], [0,1,0], [0,0,1],[1,1,1]]
 	where
@@ -296,7 +308,7 @@ test_numd1 = map (numDerivative eval . vFromList) [[1,1],[1,0],[0,1],[0,0]]
 data TEST1 = TEST1 { test1Best :: Vec, test1BestScore :: FLOAT, test1G :: [FLOAT] }
 	deriving (Show)
 newtype TEST1M a = TEST1M { runTEST1M :: StateT TEST1 IO a }
-	deriving newtype (Functor, Applicative, Monad, MonadIO)
+	deriving (Functor, Applicative, Monad, MonadIO)
 deriving instance MonadState TEST1 TEST1M
 instance Draw TEST1M where
 	drawStdNormalVec v = do
@@ -304,7 +316,7 @@ instance Draw TEST1M where
 		modify $ \t1 -> t1 { test1G = rest }
 		return $ vFromList ns
 test_anes1 = fmap fst $ flip runStateT (TEST1 mu0 (-1e10) (genNormals $ mkStdGen 10)) $ runTEST1M $ do
-	r <- aNES 10 0.01 (vFromList [10,10]) eval stop
+	r <- aNES 10 0.5 (vFromList [10,10]) eval stop
 	liftIO $ print r
 	where
 		mu0 = vFromList [10,10]
@@ -316,12 +328,17 @@ test_anes1 = fmap fst $ flip runStateT (TEST1 mu0 (-1e10) (genNormals $ mkStdGen
 			return score
 			where
 				[a,b] = vToList v
-		stop :: TEST1M Bool
+		stop :: TEST1M (Maybe Vec)
 		stop = do
 			s <- get
 			let	bs = test1BestScore s
 				bv = test1Best s
-			liftIO $ putStrLn $ "checking current best "++show bs++" for "++show bv
-			return $ bs > 9.5
+			--liftIO $ putStrLn $ "checking current best "++show bs++" for "++show bv
+			--liftIO $ getLine
+			if bs > 9.99999
+				then do
+					liftIO $ putStrLn $ "best score "++show bs++", specimen "++show bv
+					return (Just bv)
+				else return Nothing
 t = test_anes1
 
